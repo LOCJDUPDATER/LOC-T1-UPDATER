@@ -1,22 +1,38 @@
-if (-not $PSCommandPath) {
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $tempScript = Join-Path $env:TEMP 'Loc_Tier_1.ps1'
-        $url = 'https://raw.githubusercontent.com/LOCJDUPDATER/LOC-T1-UPDATER/main/Loc_Tier_1.ps1'
-        Write-Host 'Downloading LOC Tier 1...' -ForegroundColor Cyan
-        Invoke-WebRequest -Uri $url -OutFile $tempScript -UseBasicParsing
-        $hostExe = (Get-Process -Id $PID).Path
-        Start-Process -FilePath $hostExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tempScript`"") -Wait
-    } catch {
-        Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host 'Use: iwr "https://raw.githubusercontent.com/LOCJDUPDATER/LOC-T1-UPDATER/main/Loc_Tier_1.ps1" -OutFile "$env:TEMP\Loc_Tier_1.ps1" -UseBasicParsing; powershell -ExecutionPolicy Bypass -File "$env:TEMP\Loc_Tier_1.ps1"' -ForegroundColor Yellow
-    }
-    exit
-}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 Clear-Host
 
-$script:LocTier1Version = '1.5.4'
+$script:LocTier1Version = '1.5.5'
+
+function Disable-ConsoleQuickEdit {
+    try {
+        if (-not ('LocConsoleApi' -as [type])) {
+            Add-Type -Namespace Loc -Name LocConsoleApi -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@ -ErrorAction Stop
+        }
+
+        $stdin = [Loc.LocConsoleApi]::GetStdHandle(-10)
+        [uint32]$mode = 0
+        if (-not [Loc.LocConsoleApi]::GetConsoleMode($stdin, [ref]$mode)) { return }
+
+        $mode = ($mode -bor 0x0080) -band (-bnot 0x0040) -band (-bnot 0x0020)
+        [void][Loc.LocConsoleApi]::SetConsoleMode($stdin, $mode)
+    } catch {}
+}
+
+function Invoke-ConsoleRefresh {
+    try { [Console]::Out.Flush() } catch {}
+    try { [Console]::Error.Flush() } catch {}
+}
+
+Disable-ConsoleQuickEdit
+Invoke-ConsoleRefresh
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -546,6 +562,7 @@ function Write-MonitorAlert {
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host "[$timestamp] $Message" -ForegroundColor $Color
+    Invoke-ConsoleRefresh
     try {
         Add-Content -LiteralPath $LogFile -Value "[$timestamp] $Message" -ErrorAction Stop
     } catch {
