@@ -1,11 +1,71 @@
+if (-not $PSCommandPath) {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $tempScript = Join-Path $env:TEMP 'Loc_Tier_1.ps1'
+        $url = 'https://raw.githubusercontent.com/LOCJDUPDATER/LOC-T1-UPDATER/main/Loc_Tier_1.ps1'
+        Write-Host 'Downloading LOC Tier 1...' -ForegroundColor Cyan
+        Invoke-WebRequest -Uri $url -OutFile $tempScript -UseBasicParsing
+        $hostExe = (Get-Process -Id $PID).Path
+        Start-Process -FilePath $hostExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tempScript`"") -Wait
+    } catch {
+        Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host 'Use: iwr "https://raw.githubusercontent.com/LOCJDUPDATER/LOC-T1-UPDATER/main/Loc_Tier_1.ps1" -OutFile "$env:TEMP\Loc_Tier_1.ps1" -UseBasicParsing; powershell -ExecutionPolicy Bypass -File "$env:TEMP\Loc_Tier_1.ps1"' -ForegroundColor Yellow
+    }
+    exit
+}
+
 Clear-Host
 
-$script:LocTier1Version = '1.4.0'
+$script:LocTier1Version = '1.5.4'
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p = New-Object Security.Principal.WindowsPrincipal($id)
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
+function Open-LocalMachineRegistryKey {
+    param([string]$SubKeyPath)
+
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,
+            [Microsoft.Win32.RegistryView]::Registry64
+        )
+        if ([string]::IsNullOrWhiteSpace($SubKeyPath)) { return $base }
+        return $base.OpenSubKey($SubKeyPath)
+    } catch {
+        return $null
+    }
+}
+
+function Add-RegistryKeyFingerprint {
+    param(
+        [Microsoft.Win32.RegistryKey]$Key,
+        [string]$Prefix,
+        [System.Collections.Generic.List[string]]$Parts
+    )
+
+    foreach ($name in $Key.GetValueNames()) {
+        $raw = $Key.GetValue($name)
+        if ($null -eq $raw) {
+            $Parts.Add("$Prefix|$name=")
+        } elseif ($raw -is [byte[]]) {
+            $Parts.Add("$Prefix|$name=0x$([BitConverter]::ToString($raw).Replace('-', ''))")
+        } else {
+            $Parts.Add("$Prefix|$name=$raw")
+        }
+    }
+
+    foreach ($subName in $Key.GetSubKeyNames()) {
+        $subKey = $Key.OpenSubKey($subName)
+        if ($subKey) {
+            Add-RegistryKeyFingerprint -Key $subKey -Prefix "$Prefix\$subName" -Parts $Parts
+            $subKey.Close()
+        } else {
+            $Parts.Add("$Prefix\$subName=<missing>")
+        }
+    }
 }
 
 # ===============================
@@ -41,14 +101,112 @@ function Invoke-ToolDownload {
         [string]$DestDir
     )
 
+    if (-not $Url -or -not $ZipPath -or -not $DestDir) { return $false }
+
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $ZipPath -UseBasicParsing -TimeoutSec 120
-        if (-not (Test-Path $ZipPath)) { return $false }
-        if (-not (Test-Path $DestDir)) { New-Item -ItemType Directory -Path $DestDir -Force | Out-Null }
+        $zipParent = Split-Path $ZipPath -Parent
+        if ($zipParent -and -not (Test-Path $zipParent)) {
+            New-Item -ItemType Directory -Path $zipParent -Force | Out-Null
+        }
+        if (-not (Test-Path $DestDir)) {
+            New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+        }
+
+        if (Test-Path -LiteralPath $ZipPath) {
+            Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+        }
+
+        $previousProtocol = [Net.ServicePointManager]::SecurityProtocol
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+        $downloaded = $false
+        foreach ($attempt in 1..2) {
+            try {
+                Invoke-WebRequest -Uri $Url -OutFile $ZipPath -UseBasicParsing -TimeoutSec 120 `
+                    -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' | Out-Null
+                if ((Test-Path -LiteralPath $ZipPath) -and ((Get-Item -LiteralPath $ZipPath).Length -gt 1024)) {
+                    $downloaded = $true
+                    break
+                }
+            } catch {
+                if ($attempt -eq 2) { throw }
+                Start-Sleep -Seconds 2
+            }
+        }
+
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol
+        if (-not $downloaded) { return $false }
+
         Expand-Archive -Path $ZipPath -DestinationPath $DestDir -Force
         return $true
     } catch {
         Write-Warning "Download failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Resolve-ToolExecutable {
+    param(
+        [string]$DestDir,
+        [string]$ExeName,
+        [string[]]$FallbackNames = @()
+    )
+
+    foreach ($name in @($ExeName) + @($FallbackNames)) {
+        $direct = Join-Path $DestDir $name
+        if (Test-Path -LiteralPath $direct) { return $direct }
+    }
+
+    foreach ($name in @($ExeName) + @($FallbackNames)) {
+        $found = Get-ChildItem -Path $DestDir -Filter $name -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+
+    return $null
+}
+
+function Start-LocExternalTool {
+    param(
+        [string]$Name,
+        [string]$Url,
+        [string]$ZipPath,
+        [string]$DestDir,
+        [string]$ExeName,
+        [string[]]$FallbackExeNames = @(),
+        [string[]]$StartArguments = @(),
+        [switch]$Wait,
+        [ValidateSet('Normal', 'Maximized')]
+        [string]$WindowStyle = 'Normal'
+    )
+
+    $exe = Resolve-ToolExecutable -DestDir $DestDir -ExeName $ExeName -FallbackNames $FallbackExeNames
+    if (-not $exe) {
+        if (Invoke-ToolDownload -Url $Url -ZipPath $ZipPath -DestDir $DestDir) {
+            $exe = Resolve-ToolExecutable -DestDir $DestDir -ExeName $ExeName -FallbackNames $FallbackExeNames
+        }
+    }
+
+    if (-not $exe) {
+        Write-Host "WARNING: $Name unavailable (download or extract failed)." -ForegroundColor Yellow
+        return $false
+    }
+
+    try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch {}
+
+    try {
+        $startParams = @{
+            FilePath    = $exe
+            WindowStyle = $WindowStyle
+            PassThru    = $true
+            ErrorAction = 'Stop'
+        }
+        if ($StartArguments.Count -gt 0) { $startParams['ArgumentList'] = $StartArguments }
+
+        $proc = Start-Process @startParams
+        if ($Wait) { $proc.WaitForExit() }
+        return $true
+    } catch {
+        Write-Host "WARNING: $Name failed to start: $($_.Exception.Message)" -ForegroundColor Yellow
         return $false
     }
 }
@@ -72,7 +230,7 @@ function Get-Exclusions {
     foreach ($root in $regRoots) {
         foreach ($type in $regTypes) {
             try {
-                $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$root\$type")
+                $key = Open-LocalMachineRegistryKey -SubKeyPath "$root\$type"
                 if (-not $key) { continue }
                 foreach ($name in $key.GetValueNames()) {
                     if ($name) { [void]$list.Add($name) }
@@ -104,37 +262,10 @@ function Get-RegistrySubtreeFingerprint {
 
     $parts = New-Object 'System.Collections.Generic.List[string]'
 
-    function Add-KeyEntries {
-        param(
-            [Microsoft.Win32.RegistryKey]$Key,
-            [string]$Prefix
-        )
-
-        foreach ($name in $Key.GetValueNames()) {
-            $raw = $Key.GetValue($name)
-            if ($null -eq $raw) {
-                $parts.Add("$Prefix|$name=")
-            } elseif ($raw -is [byte[]]) {
-                $parts.Add("$Prefix|$name=0x$([BitConverter]::ToString($raw).Replace('-', ''))")
-            } else {
-                $parts.Add("$Prefix|$name=$raw")
-            }
-        }
-        foreach ($subName in $Key.GetSubKeyNames()) {
-            $subKey = $Key.OpenSubKey($subName)
-            if ($subKey) {
-                Add-KeyEntries -Key $subKey -Prefix "$Prefix\$subName"
-                $subKey.Close()
-            } else {
-                $parts.Add("$Prefix\$subName=<missing>")
-            }
-        }
-    }
-
     try {
-        $root = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($RelativePath)
+        $root = Open-LocalMachineRegistryKey -SubKeyPath $RelativePath
         if (-not $root) { return 'MISSING' }
-        Add-KeyEntries -Key $root -Prefix $RelativePath
+        Add-RegistryKeyFingerprint -Key $root -Prefix $RelativePath -Parts $parts
         $root.Close()
     } catch {
         return 'ERROR'
@@ -171,7 +302,7 @@ function Get-AllowedDefenderThreats {
         'SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Threats'
     )) {
         try {
-            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($relPath)
+            $key = Open-LocalMachineRegistryKey -SubKeyPath $relPath
             if (-not $key) { continue }
             foreach ($name in $key.GetValueNames()) {
                 if ($name) { [void]$list.Add("$relPath -> $name") }
@@ -185,7 +316,7 @@ function Get-AllowedDefenderThreats {
 
     foreach ($root in $script:DefenderThreatsRegRoots) {
         try {
-            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($root)
+            $key = Open-LocalMachineRegistryKey -SubKeyPath $root
             if (-not $key) { continue }
             foreach ($subName in $key.GetSubKeyNames()) {
                 if ($script:DefenderThreatsSystemSubkeys -contains $subName) { continue }
@@ -250,6 +381,61 @@ function Get-RegistryToolProcessHits {
     return $messages
 }
 
+$script:WindhawkProcessName = 'windhawk.exe'
+$script:WindhawkWatchPaths = @(
+    'C:\Users\Stef\Downloads\windhawk.exe',
+    (Join-Path $env:USERPROFILE 'Downloads\windhawk.exe'),
+    (Join-Path ${env:ProgramFiles} 'Windhawk\windhawk.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'Windhawk\windhawk.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\Windhawk\windhawk.exe')
+)
+
+function Get-WindhawkProcessHits {
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    $messages = @()
+
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='$($script:WindhawkProcessName)'" -ErrorAction Stop | ForEach-Object {
+            $procId = [int]$_.ProcessId
+            if (-not $seen.Add($procId)) { return }
+            $path = [string]$_.ExecutablePath
+            $label = "$($script:WindhawkProcessName) (PID $procId)"
+            if ($path) { $label += " -> $path" }
+            $messages += $label
+        }
+    } catch {}
+
+    return $messages
+}
+
+function Get-WindhawkStep1Alerts {
+    $alerts = @()
+    $hits = @(Get-WindhawkProcessHits)
+
+    if ($hits.Count -gt 0) {
+        foreach ($hit in $hits) {
+            $alerts += "FAILURE: Windhawk running $hit"
+        }
+        return $alerts
+    }
+
+    $foundPaths = @()
+    foreach ($p in ($script:WindhawkWatchPaths | Select-Object -Unique)) {
+        if ($p -and (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue)) {
+            $foundPaths += $p
+        }
+    }
+    if ($foundPaths.Count -gt 0) {
+        foreach ($p in $foundPaths) {
+            $alerts += "WARNING: Windhawk found $p"
+        }
+        return $alerts
+    }
+
+    $alerts += 'SUCCESS: Windhawk not detected'
+    return $alerts
+}
+
 function Get-CheatFolderHits {
     $hits = New-Object 'System.Collections.Generic.HashSet[string]'
     $scanPaths = @(
@@ -287,7 +473,7 @@ function Get-BamRegistryFingerprints {
 
     foreach ($root in $roots) {
         try {
-            $rootKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($root)
+            $rootKey = Open-LocalMachineRegistryKey -SubKeyPath $root
             if (-not $rootKey) { continue }
 
             foreach ($sidName in $rootKey.GetSubKeyNames()) {
@@ -445,7 +631,7 @@ function Get-NvidiaShadowPlayFtsState {
     }
 
     try {
-        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($script:NvidiaShadowPlayFtsRegPath)
+        $key = Open-LocalMachineRegistryKey -SubKeyPath $script:NvidiaShadowPlayFtsRegPath
         if (-not $key) { return $state }
 
         $state.Exists = $true
@@ -812,6 +998,7 @@ $exclusionsOutput      = @()
 $allowedThreatsOutput  = @()
 $memoryIntegrityOutput = @()
 $nvidiaOutput          = @()
+$windhawkOutput        = @()
 $registryOutput        = @()
 
 # ===============================
@@ -992,6 +1179,15 @@ try {
 }
 
 # ===============================
+# Windhawk
+# ===============================
+$totalChecks++
+foreach ($line in (Get-WindhawkStep1Alerts)) {
+    $windhawkOutput += $line
+    if ($line -like 'SUCCESS*') { $passedChecks++ }
+}
+
+# ===============================
 # Display Results
 # ===============================
 Write-Section "Modules" $moduleOutput
@@ -1003,6 +1199,7 @@ Write-Section "Memory Integrity" $memoryIntegrityOutput
 Write-Section "NVIDIA ShadowPlay" $nvidiaOutput
 Write-Section "Process Scan" $processOutput
 Write-Section "KeyAuth Check" $keyAuthOutput
+Write-Section "Windhawk" $windhawkOutput
 
 # ===============================
 # Success Rate
@@ -1012,7 +1209,7 @@ Write-Host "Overall Success Rate: $successRate%" -ForegroundColor Cyan
 Write-Host ""
 
 Write-Host "Press Enter to continue..." -ForegroundColor Yellow
-[Console]::ReadLine() | Out-Null
+Read-Host "Press Enter to continue" | Out-Null
 
 # ===============================
 # STEP 2 – PROCESS EXPLORER
@@ -1021,30 +1218,22 @@ Clear-Host
 Write-Host "[ Step 2 of 3 - Process Explorer ]" -ForegroundColor Cyan
 Write-Host ""
 
-$procDir = "$env:TEMP\ProcessExplorer"
-$procExe = "$procDir\procexp64.exe"
-$procZip = "$env:TEMP\procexp.zip"
-$procURL = "https://download.sysinternals.com/files/ProcessExplorer.zip"
-
-if (-not (Test-Path $procExe)) {
-    if (-not (Invoke-ToolDownload -Url $procURL -ZipPath $procZip -DestDir $procDir)) {
-        Write-Host "WARNING: Process Explorer unavailable" -ForegroundColor Yellow
-    }
-}
-
-if (Test-Path $procExe) {
-    Write-Host "Launching Process Explorer..." -ForegroundColor Green
-    Write-Host ""
-    $proc = Start-Process -FilePath $procExe -ArgumentList "/accepteula" -PassThru
-    Wait-Process -Id $proc.Id
+Write-Host "Launching Process Explorer..." -ForegroundColor Green
+Write-Host ""
+if (Start-LocExternalTool -Name 'Process Explorer' `
+        -Url 'https://download.sysinternals.com/files/ProcessExplorer.zip' `
+        -ZipPath "$env:TEMP\procexp.zip" `
+        -DestDir "$env:TEMP\ProcessExplorer" `
+        -ExeName 'procexp64.exe' `
+        -FallbackExeNames @('procexp.exe') `
+        -StartArguments @('/accepteula') `
+        -Wait) {
     Write-Host ""
     Write-Host "Process Explorer closed." -ForegroundColor Cyan
-} else {
-    Write-Host "WARNING: Process Explorer not found." -ForegroundColor Yellow
 }
 
 Write-Host "Press Enter to continue..." -ForegroundColor Yellow
-[Console]::ReadLine() | Out-Null
+Read-Host "Press Enter to continue" | Out-Null
 
 # ===============================
 # STEP 3 – LIVE MONITOR
@@ -1094,6 +1283,7 @@ $reportedNvidiaFtsChanges = @{}
 $reportedNvidiaStreamproof = @{}
 $reportedDefenderStatus = @{}
 $reportedRegistryTools = @{}
+$reportedWindhawkHits = @{}
 $reportedDefenderRegChanges = @{}
 $baselineDefenderReg = Get-DefenderRegistryFingerprints
 $defenderRegLabels = Get-DefenderRegistryMonitorLabels
@@ -1120,6 +1310,11 @@ foreach ($line in (Get-DefenderStatusAlerts)) {
         $color = if ($line -like 'FAILURE*') { 'Red' } else { 'Yellow' }
         Write-MonitorAlert -Message $line -LogFile $logFile -Color $color
     }
+}
+
+foreach ($hit in (Get-WindhawkProcessHits)) {
+    $reportedWindhawkHits[$hit] = $true
+    Write-MonitorAlert -Message "Windhawk: $hit" -LogFile $logFile -Color Red
 }
 
 while ($true) {
@@ -1184,33 +1379,42 @@ while ($true) {
                 Write-MonitorAlert -Message "Registry tool: $hit" -LogFile $logFile -Color Red
             }
         }
+
+        foreach ($hit in (Get-WindhawkProcessHits)) {
+            if (-not $reportedWindhawkHits.ContainsKey($hit)) {
+                $reportedWindhawkHits[$hit] = $true
+                Write-MonitorAlert -Message "Windhawk: $hit" -LogFile $logFile -Color Red
+            }
+        }
     }
 
     $defenderScanCounter++
     if ($defenderScanCounter -ge 5) {
         $defenderScanCounter = 0
 
-        foreach ($line in (Get-DefenderStatusAlerts)) {
-            if (-not $reportedDefenderStatus.ContainsKey($line)) {
-                $reportedDefenderStatus[$line] = $true
-                $color = if ($line -like 'FAILURE*') { 'Red' } else { 'Yellow' }
-                Write-MonitorAlert -Message $line -LogFile $logFile -Color $color
+        try {
+            foreach ($line in (Get-DefenderStatusAlerts)) {
+                if (-not $reportedDefenderStatus.ContainsKey($line)) {
+                    $reportedDefenderStatus[$line] = $true
+                    $color = if ($line -like 'FAILURE*') { 'Red' } else { 'Yellow' }
+                    Write-MonitorAlert -Message $line -LogFile $logFile -Color $color
+                }
             }
-        }
 
-        foreach ($entry in (Get-DefenderRegistryFingerprints).GetEnumerator()) {
-            $root = $entry.Key
-            $currentFp = $entry.Value
-            $baselineFp = $baselineDefenderReg[$root]
-            if ($currentFp -eq $baselineFp) { continue }
+            foreach ($entry in (Get-DefenderRegistryFingerprints).GetEnumerator()) {
+                $root = $entry.Key
+                $currentFp = $entry.Value
+                $baselineFp = $baselineDefenderReg[$root]
+                if ($currentFp -eq $baselineFp) { continue }
 
-            $changeKey = "$root|$currentFp"
-            if ($reportedDefenderRegChanges.ContainsKey($changeKey)) { continue }
-            $reportedDefenderRegChanges[$changeKey] = $true
+                $changeKey = "$root|$currentFp"
+                if ($reportedDefenderRegChanges.ContainsKey($changeKey)) { continue }
+                $reportedDefenderRegChanges[$changeKey] = $true
 
-            $label = if ($defenderRegLabels.ContainsKey($root)) { $defenderRegLabels[$root] } else { $root }
-            Write-MonitorAlert -Message "$label changed: $currentFp" -LogFile $logFile -Color Red
-        }
+                $label = if ($defenderRegLabels.ContainsKey($root)) { $defenderRegLabels[$root] } else { $root }
+                Write-MonitorAlert -Message "$label changed: $currentFp" -LogFile $logFile -Color Red
+            }
+        } catch {}
     }
 
     $folderScanCounter++
