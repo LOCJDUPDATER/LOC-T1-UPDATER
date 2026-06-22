@@ -1,5 +1,13 @@
 Clear-Host
 
+$script:LocTier1Version = '1.4.0'
+
+function Test-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p = New-Object Security.Principal.WindowsPrincipal($id)
+    return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
 # ===============================
 # ASCII Banner (LOC RECORDING POLICY T1)
 # ===============================
@@ -8,8 +16,12 @@ Write-Host "  / /  / __ \/ ___/ / _ \/ __/ ___/ __ \/ _ \/ _ \/  _/ |/ / ___/ / 
 Write-Host " / /__/ /_/ / /__  / , _/ _// /__/ /_/ / , _/ // // //    / (_ / / ___/ /_/ / /___/ // /__   \  /   / /  / / " -ForegroundColor Cyan
 Write-Host "/____/\____/\___/ /_/|_/___/\___/\____/_/|_/____/___/_/|_/\___/ /_/   \____/____/___/\___/   /_/   /_/  /_/  " -ForegroundColor Cyan
 Write-Host ""
+Write-Host "LOC Tier 1 v$($script:LocTier1Version)" -ForegroundColor White
 Write-Host "Discord.gg/locx | Complete with 100% success rate" -ForegroundColor White
 Write-Host ""
+if (-not (Test-Admin)) {
+    Write-Host "WARNING: Run as Administrator for full results." -ForegroundColor Yellow
+}
 
 function Write-Section {
     param($Title, $Lines)
@@ -71,6 +83,171 @@ function Get-Exclusions {
     }
 
     return @($list)
+}
+
+$script:DefenderExclusionsRegRoots = @(
+    'SOFTWARE\Microsoft\Windows Defender\Exclusions',
+    'SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions'
+)
+$script:DefenderThreatsRegRoots = @(
+    'SOFTWARE\Microsoft\Windows Defender\Threats',
+    'SOFTWARE\Policies\Microsoft\Windows Defender\Threats'
+)
+$script:DefenderThreatsSystemSubkeys = @(
+    'ThreatSeverityDefaultAction',
+    'ThreatIDDefaultAction',
+    'ThreatTypeDefaultAction'
+)
+
+function Get-RegistrySubtreeFingerprint {
+    param([string]$RelativePath)
+
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+
+    function Add-KeyEntries {
+        param(
+            [Microsoft.Win32.RegistryKey]$Key,
+            [string]$Prefix
+        )
+
+        foreach ($name in $Key.GetValueNames()) {
+            $raw = $Key.GetValue($name)
+            if ($null -eq $raw) {
+                $parts.Add("$Prefix|$name=")
+            } elseif ($raw -is [byte[]]) {
+                $parts.Add("$Prefix|$name=0x$([BitConverter]::ToString($raw).Replace('-', ''))")
+            } else {
+                $parts.Add("$Prefix|$name=$raw")
+            }
+        }
+        foreach ($subName in $Key.GetSubKeyNames()) {
+            $subKey = $Key.OpenSubKey($subName)
+            if ($subKey) {
+                Add-KeyEntries -Key $subKey -Prefix "$Prefix\$subName"
+                $subKey.Close()
+            } else {
+                $parts.Add("$Prefix\$subName=<missing>")
+            }
+        }
+    }
+
+    try {
+        $root = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($RelativePath)
+        if (-not $root) { return 'MISSING' }
+        Add-KeyEntries -Key $root -Prefix $RelativePath
+        $root.Close()
+    } catch {
+        return 'ERROR'
+    }
+
+    if ($parts.Count -eq 0) { return 'EMPTY' }
+    return ($parts | Sort-Object) -join '|'
+}
+
+function Get-DefenderRegistryMonitorLabels {
+    $labels = @{}
+    foreach ($root in $script:DefenderExclusionsRegRoots) {
+        $labels[$root] = "Defender Exclusions registry ($root)"
+    }
+    foreach ($root in $script:DefenderThreatsRegRoots) {
+        $labels[$root] = "Defender Threats registry ($root)"
+    }
+    return $labels
+}
+
+function Get-DefenderRegistryFingerprints {
+    $fps = @{}
+    foreach ($root in ($script:DefenderExclusionsRegRoots + $script:DefenderThreatsRegRoots)) {
+        $fps[$root] = Get-RegistrySubtreeFingerprint -RelativePath $root
+    }
+    return $fps
+}
+
+function Get-AllowedDefenderThreats {
+    $list = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($relPath in @(
+        'SOFTWARE\Microsoft\Windows Defender\Exclusions\Threats',
+        'SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Threats'
+    )) {
+        try {
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($relPath)
+            if (-not $key) { continue }
+            foreach ($name in $key.GetValueNames()) {
+                if ($name) { [void]$list.Add("$relPath -> $name") }
+            }
+            foreach ($subName in $key.GetSubKeyNames()) {
+                [void]$list.Add("$relPath\$subName")
+            }
+            $key.Close()
+        } catch {}
+    }
+
+    foreach ($root in $script:DefenderThreatsRegRoots) {
+        try {
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($root)
+            if (-not $key) { continue }
+            foreach ($subName in $key.GetSubKeyNames()) {
+                if ($script:DefenderThreatsSystemSubkeys -contains $subName) { continue }
+                if ($subName -match '(?i)^\{?[0-9A-F-]{36}\}?$|^\d+$') {
+                    [void]$list.Add("$root\$subName")
+                }
+            }
+            $key.Close()
+        } catch {}
+    }
+
+    return @($list)
+}
+
+function Get-DefenderStatusAlerts {
+    $alerts = @()
+
+    try {
+        $def = Get-MpComputerStatus -ErrorAction Stop
+        if (-not $def.RealTimeProtectionEnabled) {
+            $alerts += 'FAILURE: Real-time protection disabled'
+        }
+        if (-not $def.IsTamperProtected) {
+            $alerts += 'WARNING: Tamper protection disabled'
+        }
+    } catch {
+        $alerts += 'WARNING: Defender status unavailable'
+    }
+
+    foreach ($disableKey in @(
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender',
+        'HKLM:\SOFTWARE\Microsoft\Windows Defender'
+    )) {
+        try {
+            $disabled = Get-ItemPropertyValue -Path $disableKey -Name 'DisableAntiSpyware' -ErrorAction Stop
+            if ($disabled -eq 1) { $alerts += 'FAILURE: DisableAntiSpyware active' }
+        } catch {}
+    }
+
+    return $alerts
+}
+
+function Get-RegistryToolProcessHits {
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    $messages = @()
+
+    foreach ($procName in @('regedit.exe', 'reg.exe')) {
+        try {
+            Get-CimInstance Win32_Process -Filter "Name='$procName'" -ErrorAction Stop | ForEach-Object {
+                $procId = [int]$_.ProcessId
+                if (-not $seen.Add($procId)) { return }
+                $path = [string]$_.ExecutablePath
+                $cmd = [string]$_.CommandLine
+                $label = "$procName (PID $procId)"
+                if ($path) { $label += " -> $path" }
+                if ($cmd) { $label += " [$cmd]" }
+                $messages += $label
+            }
+        } catch {}
+    }
+
+    return $messages
 }
 
 function Get-CheatFolderHits {
@@ -447,6 +624,49 @@ function Test-MasqueradeProcessPath {
     return "Windows process '$ProcessName' running from non-standard path: $ExecutablePath"
 }
 
+function Get-SuspiciousProcessHits {
+    $hits = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $messages = @()
+
+    try {
+        Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {
+            $procName = $_.Name
+            $procPath = $_.ExecutablePath
+            $procId = $_.ProcessId
+
+            $masquerade = Test-MasqueradeProcessPath -ProcessName $procName -ExecutablePath $procPath
+            if ($masquerade) {
+                $key = "masquerade|$procName|$procPath"
+                if ($hits.Add($key)) { $messages += "FAILURE: Masquerade $procName (PID $procId)" }
+            }
+
+            $nameKw = Get-MatchedCheatKeyword -Text $procName
+            if ($nameKw) {
+                $key = "name|$procName|$nameKw"
+                if ($hits.Add($key)) { $messages += "FAILURE: $procName (PID $procId) [$nameKw]" }
+            }
+
+            if ($procPath -and -not (Test-TrustedProcessPath -ExecutablePath $procPath)) {
+                $pathKw = Get-MatchedCheatKeyword -Text $procPath
+                if ($pathKw) {
+                    $key = "path|$procPath|$pathKw|$procId"
+                    if ($hits.Add($key)) { $messages += "FAILURE: $procPath (PID $procId) [$pathKw]" }
+                }
+            }
+        }
+    } catch {
+        Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+            $nameKw = Get-MatchedCheatKeyword -Text $_.Name
+            if ($nameKw) {
+                $key = "name|$($_.Name)|$nameKw"
+                if ($hits.Add($key)) { $messages += "FAILURE: $($_.Name) (PID $($_.Id)) [$nameKw]" }
+            }
+        }
+    }
+
+    return $messages
+}
+
 function Get-ProcessSuspiciousReasons {
     param(
         [string]$ProcessName,
@@ -589,6 +809,7 @@ $osOutput              = @()
 $vmOutput              = @()
 $defenderOutput        = @()
 $exclusionsOutput      = @()
+$allowedThreatsOutput  = @()
 $memoryIntegrityOutput = @()
 $nvidiaOutput          = @()
 $registryOutput        = @()
@@ -604,12 +825,18 @@ $modules = @(
     "PowerShellGet",
     "PSReadline"
 )
-
+$moduleFails = @()
 foreach ($mod in $modules) {
-    $moduleOutput += "SUCCESS: Module '$mod' verified."
+    if (-not (Get-Module -ListAvailable -Name $mod -ErrorAction SilentlyContinue)) {
+        $moduleFails += $mod
+    }
 }
-$moduleOutput += "SUCCESS: No unauthorized modules detected."
-$passedChecks++
+if ($moduleFails.Count -eq 0) {
+    $moduleOutput += "SUCCESS: Modules OK"
+    $passedChecks++
+} else {
+    foreach ($fail in $moduleFails) { $moduleOutput += "FAILURE: Missing module $fail" }
+}
 
 # ===============================
 # CPU & GPU Detections
@@ -638,8 +865,22 @@ try {
     } else {
         $defenderOutput += "FAILURE: Windows Defender real-time protection disabled."
     }
+
+    if (-not $def.IsTamperProtected) {
+        $defenderOutput += "WARNING: Tamper protection disabled."
+    }
 } catch {
     $defenderOutput += "WARNING: Unable to query Defender."
+}
+
+foreach ($disableKey in @(
+    'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender',
+    'HKLM:\SOFTWARE\Microsoft\Windows Defender'
+)) {
+    try {
+        $disabled = Get-ItemPropertyValue -Path $disableKey -Name 'DisableAntiSpyware' -ErrorAction Stop
+        if ($disabled -eq 1) { $defenderOutput += "FAILURE: DisableAntiSpyware active." }
+    } catch {}
 }
 
 # ===============================
@@ -664,6 +905,24 @@ try {
     }
 } catch {
     $exclusionsOutput += "WARNING: Exclusions check failed."
+}
+
+# ===============================
+# Allowed Threats
+# ===============================
+$totalChecks++
+try {
+    $allowedThreats = @(Get-AllowedDefenderThreats)
+    if ($allowedThreats.Count -eq 0) {
+        $allowedThreatsOutput += "SUCCESS: No allowed threats."
+        $passedChecks++
+    } else {
+        foreach ($threat in $allowedThreats) {
+            $allowedThreatsOutput += "FAILURE: Allowed threat -> $threat"
+        }
+    }
+} catch {
+    $allowedThreatsOutput += "WARNING: Allowed threats check failed."
 }
 
 # ===============================
@@ -696,24 +955,12 @@ foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
 # Process Scan
 # ===============================
 $totalChecks++
-$suspicious = @(
-    "matcha","matrix","loader","map","severe","isabelle",
-    "photon","dx9ware","melatonin","evolve","atlanta",
-    "serotonin","aimmy","valex"
-)
-
-$foundProc = $false
-Get-Process | ForEach-Object {
-    foreach ($s in $suspicious) {
-        if ($_.Name.ToLower() -like "*$s*") {
-            $processOutput += "FAILURE: Suspicious process $($_.Name) (PID $($_.Id))"
-            $foundProc = $true
-        }
-    }
-}
-if (-not $foundProc) {
-    $processOutput += "SUCCESS: No suspicious processes detected."
+$procHits = @(Get-SuspiciousProcessHits)
+if ($procHits.Count -eq 0) {
+    $processOutput += "SUCCESS: Processes clean"
     $passedChecks++
+} else {
+    $processOutput += $procHits
 }
 
 # ===============================
@@ -721,16 +968,27 @@ if (-not $foundProc) {
 # ===============================
 $totalChecks++
 try {
-    $keyPath = "C:\ProgramData\KeyAuth\debug"
-    if (-not (Get-ChildItem $keyPath -Directory -ErrorAction SilentlyContinue)) {
-        $keyAuthOutput += "SUCCESS: No KeyAuth cheat folders."
+    $keyAuthHits = @()
+    $keyAuthRoots = @(
+        'C:\ProgramData\KeyAuth',
+        (Join-Path $env:ProgramData 'KeyAuth')
+    )
+    foreach ($keyRoot in ($keyAuthRoots | Select-Object -Unique)) {
+        if (-not (Test-Path $keyRoot)) { continue }
+        Get-ChildItem $keyRoot -Recurse -Directory -Depth 3 -ErrorAction SilentlyContinue | ForEach-Object {
+            $keyAuthHits += $_.FullName
+        }
+    }
+    if ($keyAuthHits.Count -eq 0) {
+        $keyAuthOutput += "SUCCESS: KeyAuth clean"
         $passedChecks++
     } else {
-        $keyAuthOutput += "FAILURE: Suspicious KeyAuth folders detected."
+        foreach ($hit in ($keyAuthHits | Select-Object -Unique)) {
+            $keyAuthOutput += "FAILURE: KeyAuth $hit"
+        }
     }
 } catch {
-    $keyAuthOutput += "SUCCESS: KeyAuth area clean."
-    $passedChecks++
+    $keyAuthOutput += "WARNING: KeyAuth check failed"
 }
 
 # ===============================
@@ -740,6 +998,7 @@ Write-Section "Modules" $moduleOutput
 Write-Section "CPU & GPU Detections" $cpuGpuOutput
 Write-Section "Windows Defender" $defenderOutput
 Write-Section "Defender Exclusions" $exclusionsOutput
+Write-Section "Allowed Threats" $allowedThreatsOutput
 Write-Section "Memory Integrity" $memoryIntegrityOutput
 Write-Section "NVIDIA ShadowPlay" $nvidiaOutput
 Write-Section "Process Scan" $processOutput
@@ -748,7 +1007,7 @@ Write-Section "KeyAuth Check" $keyAuthOutput
 # ===============================
 # Success Rate
 # ===============================
-$successRate = [math]::Round(($passedChecks / $totalChecks) * 100)
+if ($totalChecks -ne 0) { $successRate = [math]::Round(($passedChecks / $totalChecks) * 100) } else { $successRate = 0 }
 Write-Host "Overall Success Rate: $successRate%" -ForegroundColor Cyan
 Write-Host ""
 
@@ -796,13 +1055,15 @@ Write-Host ""
 Write-Host "Keep this window open during the match. Must show again after match." -ForegroundColor Yellow
 Write-Host ""
 
-$logFile = "$env:ProgramData\security_events.log"
+$logFile = Join-Path $env:ProgramData 'loc_tier1_security_events.log'
 try {
     if (-not (Test-Path $logFile)) { New-Item -Path $logFile -ItemType File -Force | Out-Null }
+    Write-MonitorAlert -Message "LOC Tier 1 v$($script:LocTier1Version) monitor started" -LogFile $logFile
 } catch {
     $logFile = Join-Path $env:TEMP 'loc_tier1_security_events.log'
     if (-not (Test-Path $logFile)) { New-Item -Path $logFile -ItemType File -Force | Out-Null }
     Write-Host "WARNING: Logging to $logFile" -ForegroundColor Yellow
+    Write-MonitorAlert -Message "LOC Tier 1 v$($script:LocTier1Version) monitor started" -LogFile $logFile
 }
 
 Register-WmiEvent -Class Win32_VolumeChangeEvent -SourceIdentifier USBChange | Out-Null
@@ -831,6 +1092,11 @@ $baselineCursorScheme = Get-CursorSchemeState
 $baselineNvidiaFts = Get-NvidiaShadowPlayFtsFingerprint
 $reportedNvidiaFtsChanges = @{}
 $reportedNvidiaStreamproof = @{}
+$reportedDefenderStatus = @{}
+$reportedRegistryTools = @{}
+$reportedDefenderRegChanges = @{}
+$baselineDefenderReg = Get-DefenderRegistryFingerprints
+$defenderRegLabels = Get-DefenderRegistryMonitorLabels
 $lastProcessSnapshot = Get-ProcessSnapshot
 $watchedProcesses = @{}
 $monitoringStart = Get-Date
@@ -839,11 +1105,20 @@ $deletionScanCounter = 0
 $processChangeCounter = 0
 $mainCplScanCounter = 0
 $nvidiaScanCounter = 0
+$defenderScanCounter = 0
 
 foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
     if ($line -like 'FAILURE*') {
         $reportedNvidiaStreamproof[$line] = $true
         Write-MonitorAlert -Message $line -LogFile $logFile -Color Red
+    }
+}
+
+foreach ($line in (Get-DefenderStatusAlerts)) {
+    if ($line -like 'FAILURE*' -or $line -like 'WARNING*') {
+        $reportedDefenderStatus[$line] = $true
+        $color = if ($line -like 'FAILURE*') { 'Red' } else { 'Yellow' }
+        Write-MonitorAlert -Message $line -LogFile $logFile -Color $color
     }
 }
 
@@ -901,6 +1176,40 @@ while ($true) {
                 $reportedMainCplHits[$hit] = $true
                 Write-MonitorAlert -Message $hit -LogFile $logFile -Color Yellow
             }
+        }
+
+        foreach ($hit in (Get-RegistryToolProcessHits)) {
+            if (-not $reportedRegistryTools.ContainsKey($hit)) {
+                $reportedRegistryTools[$hit] = $true
+                Write-MonitorAlert -Message "Registry tool: $hit" -LogFile $logFile -Color Red
+            }
+        }
+    }
+
+    $defenderScanCounter++
+    if ($defenderScanCounter -ge 5) {
+        $defenderScanCounter = 0
+
+        foreach ($line in (Get-DefenderStatusAlerts)) {
+            if (-not $reportedDefenderStatus.ContainsKey($line)) {
+                $reportedDefenderStatus[$line] = $true
+                $color = if ($line -like 'FAILURE*') { 'Red' } else { 'Yellow' }
+                Write-MonitorAlert -Message $line -LogFile $logFile -Color $color
+            }
+        }
+
+        foreach ($entry in (Get-DefenderRegistryFingerprints).GetEnumerator()) {
+            $root = $entry.Key
+            $currentFp = $entry.Value
+            $baselineFp = $baselineDefenderReg[$root]
+            if ($currentFp -eq $baselineFp) { continue }
+
+            $changeKey = "$root|$currentFp"
+            if ($reportedDefenderRegChanges.ContainsKey($changeKey)) { continue }
+            $reportedDefenderRegChanges[$changeKey] = $true
+
+            $label = if ($defenderRegLabels.ContainsKey($root)) { $defenderRegLabels[$root] } else { $root }
+            Write-MonitorAlert -Message "$label changed: $currentFp" -LogFile $logFile -Color Red
         }
     }
 
